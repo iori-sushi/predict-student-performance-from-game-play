@@ -1,0 +1,9 @@
+input/
+*checkout*
+*checkpoint*
+checkpoint/
+notebook/failure/
+notebook/old/
+jo_wilder/
+*.csv
+.ipynb_checkpoints
