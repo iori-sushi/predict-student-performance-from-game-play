@@ -45,9 +45,9 @@ torch.autograd.set_detect_anomaly(True)
 class CFG:
     # hyper parameters
     EPOCHS = 50
-    PRETRAIN_EPOCHS = 100
+    PRETRAIN_EPOCHS = 50
     THRESHOLD = .5
-    BATCH_SIZE = 2**6
+    BATCH_SIZE = 2**12
     WARM_UP = min(20, EPOCHS//10) # do not stop early
     EARLY_STOPPING_ROUNDS = max(EPOCHS//20, WARM_UP)
     LEARNING_RATE = .01
@@ -59,26 +59,21 @@ class CFG:
     PREDICT_ALL = False # True or False
     
     SUBMISSION_MODE = False
-    CHECKPOINT = False
-    RESUME = True
+    CHECKPOINT = True
     PRETRAINING_OMIT = True
     TRAINING_OMIT = False
     if SUBMISSION_MODE:
         CHECKPOINT = False
-        RESUME = False
         PRETRAINING_OMIT = True
         TRAINING_OMIT = True
         VERBOSE = False
     elif CHECKPOINT:
-        RESUME = False
         PRETRAINING_OMIT = False
         TRAINING_OMIT = False
-    else:
-        RESUME = True
-        if TRAINING_OMIT:
-            PRETRAINING_OMIT = True
+    elif TRAINING_OMIT:
+        PRETRAINING_OMIT = True
     INPUT = '../input'
-    CHECKPOINT_PATH = '../checkpoint/PretrainAsDynamicData/'
+    CHECKPOINT_PATH = '../checkpoint/PretrainFromDynamicData/'
     if not os.path.exists(CHECKPOINT_PATH):
         os.mkdir(CHECKPOINT_PATH)
 
@@ -100,12 +95,12 @@ questions = ['q'+str(i) for i in range(1,19)]
 # %env CUDA_LAUNCH_BLOCKING=1
 # -
 
+2**16 % 2**12
+
+
 # ## Functions & Classes
 
 # ### Data Processing Class
-
-# +
-# %%time
 
 class DataProcessing():
     def __init__(
@@ -223,7 +218,8 @@ class DataProcessing():
         del session_change_index, translate_table
         gc.collect()
         
-        assert len(session_index)==x_continuous.shape[0]==x_categorical.shape[0], ("Length Differ Between Outputs.")
+        assert len(session_index)==x_continuous.shape[0]==x_categorical.shape[0],\
+        ("Length Differ Between Outputs.")
         
         return x_categorical, x_continuous, session_index
     
@@ -356,32 +352,101 @@ class DataProcessing():
         return categorical, continuous, session_index
 
 
+# ### Dataloader Creating Functions
 
 # +
-# %%time
+def create_loader_train(
+    x_categorical:torch.Tensor,
+    x_continuous:torch.Tensor,
+    y:pd.DataFrame,
+    session_index:list,
+    level_group="0-4",
+    train_rate:float=.9,
+    predict_all:float=False
+):
+    if predict_all:
+        pass
+    else:
+        y = y[lq_dict[level_group]]
+        
+    msss = MultilabelStratifiedShuffleSplit(
+        n_splits=1,
+        test_size=.2,
+        random_state=CFG.SEED
+    )
+    res = msss.split(X=y.values, y=y.values)
+    for train_index, val_index in res:
+        y_train = y.iloc[train_index.tolist(),:]
+        y_val = y.iloc[val_index.tolist(),:]
+        
+    train_index=y_train.index
+    val_index=y_val.index
 
-dp = DataProcessing()
-train = dp.fit_transform(f"{CFG.INPUT}/train.csv")
-test = dp.transform(f"{CFG.INPUT}/test.csv")
-train_labels = dp.get_labels()
+    train_index=[i in train_index for i in np.array(session_index)]
+    val_index=[i in val_index for i in np.array(session_index)]
+    
+    train_loader = DataLoader(
+        TensorDataset(
+            x_categorical[train_index],
+            x_continuous[train_index],
+            torch.Tensor(y_train.values),
+        ),
+        batch_size=CFG.BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+    )
+
+    val_loader = DataLoader(
+        TensorDataset(
+            x_categorical[val_index],
+            x_continuous[val_index],
+            torch.Tensor(y_val.values),
+        ),
+        batch_size=CFG.BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+    )
+
+    del train_index
+    gc.collect()
+
+    return train_loader, val_loader
+
+def create_loader_test(
+    x_categorical:torch.Tensor,
+    x_continuous:torch.Tensor,
+    level_group=None
+):
+    if CFG.SUBMISSION_MODE:
+        pass
+
+    test_loader = DataLoader(
+        x_categorical, x_continuous,
+        batch_size=CFG.BATCH_SIZE, shuffle=False
+    )
+    
+    return test_loader
+
+
 # -
-
-model = Encoder(dp.num_total_tokens, dp.num_continuous, dp.filter_size)
-model(test[0], test[1]).shape
-
 
 # ### PretrainModel
 
-class Encoder(nn.Module):
+# +
+class PretrainModel(nn.Module):
     def __init__(
         self,
         num_total_tokens:int,
         num_continuous:int,
         filter_size:int=10,
+        num_features:int=11,
         dim:int=32,
+        num_outputs_projection_head:int=128,
         heads:int=8,
         dim_head:int=16,
         attention_dropout:float=.1,
+        real_space_aug_func=None, # cutmix?
+        latent_space_aug_func=None, # mixup?
         pretrain_label_continuous:str="elapsed_time",
         continuous_features:list=[
             'elapsed_time',
@@ -389,42 +454,190 @@ class Encoder(nn.Module):
             'distance_room',
             'distance_screen'
         ],
+        temperature=0.7,
+        num_negative_keys:int=2**16
     ):
-        super(Encoder, self).__init__()
-        self.num_total_tokens = num_total_tokens
-        self.num_continuous = num_continuous
-        self.dim = dim
+        super(PretrainModel, self).__init__()
+        self.encoder = Encoder(
+            num_total_tokens=num_total_tokens,
+            num_continuous=num_continuous,
+            filter_size=filter_size,
+            num_features=num_features,
+            dim=dim,
+            num_outputs=num_outputs_projection_head,
+            heads=heads,
+            dim_head=dim_head,
+            attention_dropout=attention_dropout,
+            real_space_aug_func=None,
+            latent_space_aug_func=None
+        )
+        self.momentum_encoder = Encoder(
+            num_total_tokens=num_total_tokens,
+            num_continuous=num_continuous,
+            filter_size=filter_size,
+            num_features=num_features,
+            dim=dim,
+            num_outputs=num_outputs_projection_head,
+            heads=heads,
+            dim_head=dim_head,
+            attention_dropout=attention_dropout,
+            real_space_aug_func=real_space_aug_func,
+            latent_space_aug_func=latent_space_aug_func
+        )
+        
+        for param, param_m in zip(
+            self.encoder.parameters(),
+            self.momentum_encoder.parameters()
+        ):
+            param_m.data.copy_(param_m.data)
+            param_m.requires_grad=True
+            
         self.pretrain_label_continuous_idx = continuous_features.index(pretrain_label_continuous)
+
+        self.temperature = temperature
+        self.num_negative_keys = num_negative_keys
         
-        self.embedding = Embedding(num_total_tokens, num_continuous, filter_size, dim)
-        self.column_attention = Attention(dim, heads, dim_head, attention_dropout)
-        self.row_attention = Attention(dim, heads, dim_head, attention_dropout)
-        
-    def forward(
-        self,
-        x_categorical:torch.Tensor,
-        x_continuous:torch.Tensor,
-        pretrain_mode:bool=True
-    ):
-        x = torch.concat(self.embedding(x_categorical.clone(), x_continuous.clone()), dim=2)
-        x = self.column_attention(x)
-        x = torch.permute(x, (0,2,1,3))
-        x = self.row_attention(x)
-        x = torch.permute(x, (0,2,1,3))
-        
-        if pretrain_model:
-            label_categorical, label_continuous = self.make_label(x_categorical, x_continuous)
-        
-        return x
-    
-    def make_label(self, x_categorical, x_continuous):
-        label_categociral = F.one_hot(
+        self.register_buffer(
+            "queue",
+            torch.randn(num_outputs_projection_head, num_negative_keys).to(CFG.DEVICE)
+        )
+        self.queue = F.normalize(self.queue, dim=0)
+        self.register_buffer("queue_pointer", torch.zeros(1, dtype=torch.int64).to(CFG.DEVICE))
+            
+    @torch.no_grad()
+    def _update_mencoder(self, m:float=.999):
+        for param, param_m in zip(
+            self.encoder.parameters(),
+            self.momentum_encoder.parameters()
+        ):
+            param_m.data = param.data*m + param.data*(1-m)
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, key):
+        batch_size = key.shape[0]
+        if self.num_negative_keys % batch_size == 0:
+            pointer = int(self.queue_pointer)
+
+            # replace the keys at pointer (dequeue and enqueue)
+            self.queue[:, pointer:(pointer+batch_size)] = key.t()
+            pointer = (pointer + batch_size) % self.num_negative_keys  # move pointer
+            self.queue_pointer[0] = pointer
+            
+    @torch.no_grad()
+    def _make_label(self, x_categorical, x_continuous):
+        label_categorical = F.one_hot(
             x_categorical[:,:,0].to(torch.int64),
             num_classes=torch.unique(x_categorical[:,:,0]).shape[0]
         ).to(torch.int8)
         label_continuous = x_continuous[:, self.pretrain_label_continuous_idx]
         return label_categorical, label_continuous
+    
+    def forward(
+        self,
+        x_categorical:torch.Tensor,
+        x_continuous:torch.Tensor,
+        pretrain_mode:bool=False
+    ):
+        query = self.encoder(x_categorical.clone(), x_continuous.clone())
+        query = F.normalize(query, dim=1)
+
+        with torch.no_grad():            
+            if pretrain_mode:
+                label_categorical, label_continuous = self._make_label(
+                    x_categorical.clone(),
+                    x_continuous.clone()
+                )
+            self._update_mencoder()
+            key = self.momentum_encoder(x_categorical.clone(), x_continuous.clone())
+            key = F.normalize(key, dim=1)
+            
+        l_pos = torch.einsum("nc,nc->n", [query, key]).unsqueeze(-1)
+        l_neg = torch.einsum("nc,ck->nk", [query, self.queue.clone().detach()])
+        logits = torch.cat([l_pos, l_neg], dim=1)
+        logits /= self.temperature
+        targets = torch.zeros(logits.shape[0], dtype=torch.int64).to(CFG.DEVICE)
+        loss = F.cross_entropy(logits, targets, reduction="mean")
+        self._dequeue_and_enqueue(key)
         
+        return loss
+
+class Constrastive(nn.Module):
+    def __init__(self, num_features, dim=32):
+        super(Constrastive, self).__init__()
+        units = [
+            dim*num_features,
+            6*dim*num_features//5,
+            dim*num_features//2
+        ]
+        self.projection_head_true = MLP(units)
+        self.projection_head_false = MLP(units)
+        self.reshaping = lambda x: (x / x.norm(dim=-1, keepdim=True)).flatten(1,2)
+        self.temperature = temperature
+        
+    def forward(self, x_true, x_false):
+        x_true, x_false = self.reshaping(x_true), self.reshaping(x_false)
+        x_true = F.normalize(self.projection_head_true(x_true), dim=-1).flatten(1)
+        x_false = F.normalize(self.projection_head_false(x_false), dim=-1).flatten(1)  
+        logits = x_true @ x_false.t() / self.temperature
+        logits_ =  x_false @ x_true.t() / self.temperature
+        targets = torch.arange(logits.size(0)).to(CFG.DEVICE)
+        loss = F.cross_entropy(logits, targets, reduction="mean")
+        loss_ = F.cross_entropy(logits_, targets, reduction="mean")
+        loss = (loss + loss_) / 2
+        return loss
+
+
+# -
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        num_total_tokens:int,
+        num_continuous:int,
+        filter_size:int=10,
+        num_features:int=11,
+        dim:int=32,
+        num_outputs:int=128,
+        heads:int=8,
+        dim_head:int=16,
+        attention_dropout:float=.1,
+        real_space_aug_func=None, # cutmix?
+        latent_space_aug_func=None, # mixup?
+    ):
+        super(Encoder, self).__init__()
+        self.num_total_tokens = num_total_tokens
+        self.num_continuous = num_continuous
+        self.dim = dim
+        
+        self.real_space_aug_func = real_space_aug_func
+        self.latent_space_aug_func = latent_space_aug_func
+
+        self.embedding = Embedding(num_total_tokens, num_continuous, filter_size, dim)
+        self.column_attention = Attention(dim, heads, dim_head, attention_dropout)
+        self.time_series_attention = Attention(dim, heads, dim_head, attention_dropout)
+        self.projection_head = ProjectionHead(filter_size, num_features, dim, num_outputs)
+        
+    def forward(
+        self,
+        x_categorical:torch.Tensor,
+        x_continuous:torch.Tensor,
+    ):        
+        if self.real_space_aug_func:
+            x_categorical = self.real_space_aug_func(x_categorical)
+            x_continuous = self.real_space_aug_func(x_continuous)
+        
+        x = torch.concat(self.embedding(x_categorical, x_continuous), dim=2)
+
+        if self.latent_space_aug_func:
+            x = self.latent_space_aug_func(x)
+    
+        x = self.column_attention(x)
+        x = torch.permute(x, (0,2,1,3))
+        x = self.time_series_attention(x)
+        x = torch.permute(x, (0,2,1,3))
+        x = self.projection_head(x.flatten(1))
+        
+        return x
 
 
 # +
@@ -480,7 +693,7 @@ class EmbeddingContinuous(nn.Module):
         )
         
     def forward(self, x):
-        x_enc = torch.zeros(*x.shape, self.dim) # batch_size, filter_size, num_features, dim 
+        x_enc = torch.empty(*x.shape, self.dim).to(CFG.DEVICE) # batch_size, filter_size, num_features, dim 
         for s in range(self.filter_size):
             for i in range(self.num_continuous):
                 x_enc[:,s,i,:] = self.projections[s*self.num_continuous+i](x[:,s,i])
@@ -497,9 +710,7 @@ class ProjectingContinuous(nn.Module):
         self.linear2 = nn.Linear(intermediate_unit, dim)
         
     def forward(self, x):
-        if len(x.shape)==1:
-            x = x.view(x.size(0), -1)
-        
+        x = x.view(x.size(0), -1)
         x = F.sigmoid(self.linear1(x))
         x = self.linear2(x)
         return x
@@ -551,72 +762,54 @@ class Attention(nn.Module):
         return attention
 
 
-# ### Dataloader Creating Functions
+class ProjectionHead(nn.Module):
+    def __init__(
+        self,
+        filter_size:int,
+        num_features:int,
+        dim:int,
+        num_outputs:int=128
+    ):
+        super(ProjectionHead, self).__init__()
+        units = [
+            filter_size*num_features*dim,
+            filter_size*num_features*dim*6,
+            num_outputs
+        ]
+        self.linear1 = nn.Linear(units[0], units[1])
+        self.linear2 = nn.Linear(units[1], units[2])
+        
+    def forward(self, x):
+        # x -> batch_size, filter_size, num_features, dim
+        x = x.flatten(1) # -> batch_size, -1 
+        x = self.linear1(x)
+        x = F.relu(x)
+        x = self.linear2(x) # -> batch_size, filter_size*num_features*dim/8
+        return x
+
+
+# ### Augmentation Functions
 
 # +
-def create_loader_train(X, X_mask, y, level_group=None, train_rate=.9, predict_all=False):
-    if level_group:
-        X = X.query(f'level_group=="{level_group}"')
-        X = X.reset_index().drop("level_group", axis=1).set_index("session_id")
-        X_mask = X_mask.query(f'level_group=="{level_group}"')
-        X_mask = X_mask.reset_index().drop("level_group", axis=1).set_index("session_id")
-    
-    if predict_all:
-        pass
-    else:
-        y = y[lq_dict[level_group]]
-        
-    msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=1-train_rate, random_state=CFG.SEED)
-    res = msss.split(X.values, y.values)
-    for train_index, val_index in res:
-        train_index = train_index.tolist()
-        val_index = val_index.tolist()
-
-    train_loader = DataLoader(
-        TensorDataset(
-            torch.Tensor(X.iloc[train_index, :].values),
-            torch.Tensor(X_mask.iloc[train_index, :].values).type(torch.int),
-            torch.Tensor(y.iloc[train_index, :].values),
-        ),
-        batch_size=CFG.BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
+def cutmix(x:torch.Tensor, m:float=.1):
+    x = x.clone()
+    batch_size, filter_size, *others = x.shape
+    x_shuffle = x[torch.randperm(batch_size)]
+    random_choice = torch.from_numpy(
+        np.random.choice(
+            2,
+            ([batch_size, filter_size]+others),
+            p=[m,1-m]
+        )
     )
+    x[random_choice==0] = x_shuffle[random_choice==0]
+    return x
 
-    val_loader = DataLoader(
-        TensorDataset(
-            torch.Tensor(X.iloc[val_index, :].values),
-            torch.Tensor(X_mask.iloc[val_index, :].values).type(torch.int),
-            torch.Tensor(y.iloc[val_index, :].values),
-        ),
-        batch_size=CFG.BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-    )
-
-    del train_index
-    gc.collect()
-
-    return train_loader, val_loader
-
-def create_loader_test(X, X_mask, level_group=None):
-    if CFG.SUBMISSION_MODE:
-        pass
-    elif level_group:
-        X = X.query(f'level_group=="{level_group}"')
-        X = X.reset_index().drop("level_group", axis=1).set_index("session_id")
-        X_mask = X_mask.query(f'level_group=="{level_group}"')
-        X_mask = X_mask.reset_index().drop("level_group", axis=1).set_index("session_id")
-
-    test_loader = DataLoader(
-        TensorDataset(
-            torch.Tensor(X.values),
-            torch.Tensor(X_mask.values).type(torch.int),
-        ),
-        batch_size=1000, shuffle=False
-    )
-    
-    return test_loader
+def mixup(x:torch.Tensor, alpha:float=.1):
+    x = x.clone()
+    index = torch.randperm(x.shape[0])
+    x = alpha*x + (1-alpha)*x[index, :]
+    return x
 
 
 # -
@@ -993,9 +1186,6 @@ class PretrainingSAINT(nn.Module):
         denoising_loss = self.denoising(x_false.clone(), x.clone())
         
         return contrastive_loss, denoising_loss
-
-
-np.random.choice(4,(4,4),p=[.25,.25,.25, .25])
 
 
 # ### Pretraining Function
@@ -1490,46 +1680,16 @@ if CFG.SUBMISSION_MODE:
         thresholds = pickle.load(f)
         
 else:
-    if CFG.RESUME:
-        with open(f"{CFG.CHECKPOINT_PATH}/dp.pickle", "rb") as f:
-            dp = pickle.load(f)
-        
-        with open(f"{CFG.CHECKPOINT_PATH}/train.pickle", "rb") as f:
-            train = pickle.load(f)
-        
-        test = dp.transform(f"{CFG.INPUT}/test.csv")
-        
-        with open(f"{CFG.CHECKPOINT_PATH}/cooccurence_rate.pickle", "rb") as f:
-            cooccurence_rate = pickle.load(f)
-        
-        train_labels = pd.read_csv(f"{CFG.INPUT}/train_labels.csv", engine='python')
-        train_labels[["session_id", "question"]] = train_labels.session_id.str.split("_", expand=True)
-        train_labels = train_labels[["session_id", "question", "correct"]]
-        train_labels["session_id"] = train_labels["session_id"].astype(int)
-        train_labels = train_labels.pivot(index="session_id", columns="question", values="correct").sort_index()
-        train_labels = train_labels.reindex(columns=questions)
-    else:
-        dp = DataProcessing()
+    dp = DataProcessing(stride=10, filter_size=20)
+    x_categorical, x_continuous, session_index = dp.fit_transform(f"{CFG.INPUT}/train.csv")
+    x_categorical_test, x_continuous_test, session_index_test = dp.transform(f"{CFG.INPUT}/test.csv")
+    train_labels = dp.get_labels()
 
-        train = dp.fit_transform(f"{CFG.INPUT}/train.csv")
-        test = dp.transform(f"{CFG.INPUT}/test.csv")
+    if CFG.CHECKPOINT:
+        with open(f"{CFG.CHECKPOINT_PATH}/dp.pickle", "wb") as f:
+            pickle.dump(dp, f)
 
-        if CFG.CHECKPOINT:
-            with open(f"{CFG.CHECKPOINT_PATH}/dp.pickle", "wb") as f:
-                pickle.dump(dp, f)
-            with open(f"{CFG.CHECKPOINT_PATH}/train.pickle", "wb") as f:
-                pickle.dump(train, f)
-
-        del dp
-        gc.collect()
-
-        train_labels = pd.read_csv(f"{CFG.INPUT}/train_labels.csv", engine='python')
-        train_labels[["session_id", "question"]] = train_labels.session_id.str.split("_", expand=True)
-        train_labels = train_labels[["session_id", "question", "correct"]]
-        train_labels["session_id"] = train_labels["session_id"].astype(int)
-        train_labels = train_labels.pivot(index="session_id", columns="question", values="correct").sort_index()
-        train_labels = train_labels.reindex(columns=questions)
-
+    if False:
         check = train_labels.copy()
         res = {}
         for session_id, row in check[questions].iterrows():
@@ -1549,6 +1709,70 @@ else:
             with open(f"{CFG.CHECKPOINT_PATH}/cooccurence_rate.pickle", "wb") as f:
                 pickle.dump(cooccurence_rate, f)
 # -
+
+train_loader, val_loader = create_loader_train(
+    x_categorical=x_categorical,
+    x_continuous=x_continuous,
+    y=train_labels,
+    session_index=session_index,
+    level_group=dp.level_group,
+    train_rate=.9,
+    predict_all=False
+)
+
+# +
+# %%time
+
+model = PretrainModel(
+    num_total_tokens=dp.num_total_tokens,
+    num_continuous=dp.num_continuous,
+    filter_size=dp.filter_size,
+    num_features=11,
+    dim=32,
+    num_outputs_projection_head=128,
+    heads=8,
+    dim_head=16,
+    attention_dropout=.1,
+    real_space_aug_func=cutmix,
+    latent_space_aug_func=mixup,
+    temperature=0.7,
+    num_negative_keys=2**16
+).to(CFG.DEVICE)
+
+optimizer = torch.optim.AdamW(model.parameters(),lr=0.003)
+losses = [10**10]
+model.train()
+level_group="0-4"
+checkpoint_path = f"{CFG.CHECKPOINT_PATH}/pretrain_params_{level_group}.pth"
+
+print("Pretraining is starting...") 
+for epoch in tqdm(range(CFG.PRETRAIN_EPOCHS)):
+    loss_sum = 0.0
+    for i, (x_categorical, x_continuous) in enumerate(train_loader):
+        x_categorical, x_continuous = x_categorical.to(CFG.DEVICE), x_continuous.to(CFG.DEVICE)
+        loss = model(x_categorical, x_continuous)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        loss_sum += loss.item()
+
+    epoch_loss = loss_sum/i
+    if epoch_loss < min(losses):
+        best_epoch = epoch
+        torch.save(model.state_dict(), checkpoint_path)
+    losses.append(epoch_loss)
+
+    print(f"Epoch {epoch+1}/{CFG.PRETRAIN_EPOCHS}: loss {epoch_loss: .4f}")
+
+model.load_state_dict(torch.load(checkpoint_path))
+print(f"Pretraining has finished.\nBest Epoch is {best_epoch} with loss {min(losses)} !")
+# -
+
+4096 / (2**8)
+
+epoch_loss
 
 # ## Deep Learning
 
