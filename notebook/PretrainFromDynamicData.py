@@ -44,10 +44,11 @@ torch.autograd.set_detect_anomaly(True)
 
 class CFG:
     # hyper parameters
-    EPOCHS = 50
-    PRETRAIN_EPOCHS = 50
+    EPOCHS = 200
+    PRETRAIN_EPOCHS = 11
     THRESHOLD = .5
-    BATCH_SIZE = 2**12
+    PRETRAIN_BATCH_SIZE = 2**10
+    BATCH_SIZE = 2**6
     WARM_UP = min(20, EPOCHS//10) # do not stop early
     EARLY_STOPPING_ROUNDS = max(EPOCHS//20, WARM_UP)
     LEARNING_RATE = .01
@@ -59,21 +60,27 @@ class CFG:
     PREDICT_ALL = False # True or False
     
     SUBMISSION_MODE = False
-    CHECKPOINT = True
-    PRETRAINING_OMIT = True
+    CHECKPOINT = False
+    RESUME = True
+    PRETRAIN_OMIT = False
     TRAINING_OMIT = False
     if SUBMISSION_MODE:
         CHECKPOINT = False
-        PRETRAINING_OMIT = True
+        RESUME = False
+        PRETRAIN_OMIT = True
         TRAINING_OMIT = True
         VERBOSE = False
     elif CHECKPOINT:
-        PRETRAINING_OMIT = False
+        RESUME = False
+        PRETRAIN_OMIT = False
         TRAINING_OMIT = False
-    elif TRAINING_OMIT:
-        PRETRAINING_OMIT = True
+    else:
+        RESUME = True
+        if TRAINING_OMIT:
+            PRETRAIN_OMIT = True
+            
     INPUT = '../input'
-    CHECKPOINT_PATH = '../checkpoint/PretrainFromDynamicData/'
+    CHECKPOINT_PATH = '../checkpoint/PretrainFromDynamicData'
     if not os.path.exists(CHECKPOINT_PATH):
         os.mkdir(CHECKPOINT_PATH)
 
@@ -94,9 +101,6 @@ questions = ['q'+str(i) for i in range(1,19)]
 
 # %env CUDA_LAUNCH_BLOCKING=1
 # -
-
-2**16 % 2**12
-
 
 # ## Functions & Classes
 
@@ -129,7 +133,7 @@ class DataProcessing():
         if path:
             self.df = pd.read_csv(path)
             self.df = self.df.query(f"level_group=='{self.level_group}'").reset_index(drop=True)
-        if df:
+        if df is not None:
             self.df = df.copy()
             self.df = self.df.query(f"level_group=='{self.level_group}'").reset_index(drop=True)
         df = self.df.copy()
@@ -203,7 +207,7 @@ class DataProcessing():
         session_change_index = df.session_id.diff()!=0
         session_change_index = session_change_index[session_change_index].index.to_list()
         session_change_index += [len(df)]
-        translate_table = {k:df.loc[k, ["session_id"]].tolist()[0] for k in session_change_index[:-1]}
+        translate_table = {k:df.loc[k, "session_id"] for k in session_change_index[:-1]}
 
         del df, self.df
         gc.collect()
@@ -220,6 +224,8 @@ class DataProcessing():
         
         assert len(session_index)==x_continuous.shape[0]==x_categorical.shape[0],\
         ("Length Differ Between Outputs.")
+        
+        session_index = [int(i) for i in session_index]
         
         return x_categorical, x_continuous, session_index
     
@@ -274,7 +280,9 @@ class DataProcessing():
         if fit:
             self.num_special_tokens = num_special_tokens
             self.num_continuous = len(self.continuous_features)
+            self.num_categorical = len(self.categorical_features)
             self.categories = [df[col].nunique() for col in self.categorical_features]
+            self.num_features = self.num_continuous + self.num_categorical
             self.categories_offset = torch.Tensor(
                 [self.num_special_tokens]+self.categories
             ).int().cumsum(dim=-1)
@@ -306,16 +314,14 @@ class DataProcessing():
         for i in range(len(change_index)-1):
             begining = change_index[i]
             ending = change_index[i+1]
-            for i2 in range(begining, ending-filter_size+1, stride):
-                categorical_data.append(categorical[i2:i2+filter_size])
-                continuous_data.append(continuous[i2:i2+filter_size])
-                session_index.append(translate_table[begining])
+            session = translate_table[begining]
+            
             # head    
             categorical_data.append(
                 torch.concat(
                     [
                         self.all_pad_tensor.repeat(stride).view(stride, -1),
-                        categorical[begining:begining+(filter_size-stride)]
+                        categorical[begining:begining+filter_size-stride]
                     ], axis=0
                 )
             )
@@ -323,15 +329,23 @@ class DataProcessing():
                 torch.concat(
                     [
                         all_pad_continuous.repeat(stride).view(stride, -1),
-                        continuous[begining:begining+(filter_size-stride)]
+                        continuous[begining:begining+filter_size-stride]
                     ], axis=0
                 )
             )
+            session_index += [session]
+            
+            # intermediate
+            for i2 in range(begining, ending-filter_size+1, stride):
+                categorical_data.append(categorical[i2:i2+filter_size])
+                continuous_data.append(continuous[i2:i2+filter_size])
+                session_index.append(session)
+                
             # tail
             continuous_data.append(
                 torch.concat(
                     [
-                        continuous[ending-(filter_size-stride):ending],
+                        continuous[ending-filter_size+stride:ending],
                         all_pad_continuous.repeat(stride).view(stride, -1)
                     ], axis=0
                 )
@@ -339,15 +353,15 @@ class DataProcessing():
             categorical_data.append(
                 torch.concat(
                     [
-                        categorical[ending-(filter_size-stride):ending],
+                        categorical[ending-filter_size+stride:ending],
                         self.all_pad_tensor.repeat(stride).view(stride, -1)
                     ], axis=0
                 )
             )
-            session_index += [translate_table[begining]]*2
+            session_index += [session]
             
-        categorical = torch.stack(categorical_data)
-        continuous = torch.stack(continuous_data)
+        categorical = torch.concat(categorical_data, dim=0).view(-1, filter_size, self.num_categorical)
+        continuous = torch.concat(continuous_data, dim=0).view(-1, filter_size, self.num_continuous)
             
         return categorical, continuous, session_index
 
@@ -355,7 +369,7 @@ class DataProcessing():
 # ### Dataloader Creating Functions
 
 # +
-def create_loader_train(
+def create_loader_pretrain(
     x_categorical:torch.Tensor,
     x_continuous:torch.Tensor,
     y:pd.DataFrame,
@@ -364,51 +378,75 @@ def create_loader_train(
     train_rate:float=.9,
     predict_all:float=False
 ):
-    if predict_all:
-        pass
-    else:
-        y = y[lq_dict[level_group]]
-        
+    y = y[lq_dict[level_group]]
+    
     msss = MultilabelStratifiedShuffleSplit(
         n_splits=1,
-        test_size=.2,
+        test_size=1-train_rate,
         random_state=CFG.SEED
     )
     res = msss.split(X=y.values, y=y.values)
     for train_index, val_index in res:
         y_train = y.iloc[train_index.tolist(),:]
         y_val = y.iloc[val_index.tolist(),:]
+        y_train_sessions = y_train.index
+        y_val_sessions = y_val.index
         
-    train_index=y_train.index
-    val_index=y_val.index
-
-    train_index=[i in train_index for i in np.array(session_index)]
-    val_index=[i in val_index for i in np.array(session_index)]
+    x_train_sessions=[i if i in y_train_sessions else np.nan for i in np.array(session_index)]
+    x_val_sessions=[i if i in y_val_sessions else np.nan for i in np.array(session_index)]
     
-    train_loader = DataLoader(
+    train_index = ~np.isnan(np.array(x_train_sessions))
+    val_index = ~np.isnan(np.array(x_val_sessions))
+    
+    x_train_loader = DataLoader(
         TensorDataset(
             x_categorical[train_index],
             x_continuous[train_index],
-            torch.Tensor(y_train.values),
         ),
-        batch_size=CFG.BATCH_SIZE,
-        shuffle=True,
+        batch_size=CFG.PRETRAIN_BATCH_SIZE,
+        shuffle=False,
         num_workers=4,
     )
 
-    val_loader = DataLoader(
+    x_val_loader = DataLoader(
         TensorDataset(
             x_categorical[val_index],
             x_continuous[val_index],
-            torch.Tensor(y_val.values),
         ),
         batch_size=CFG.BATCH_SIZE,
-        shuffle=True,
+        shuffle=False,
         num_workers=4,
     )
 
-    del train_index
+    del train_index, val_index
     gc.collect()
+
+    x_train_sessions=[i for i in x_train_sessions if not np.isnan(i)]
+    x_val_sessions=[i for i in x_val_sessions if not np.isnan(i)]
+
+    return x_train_loader, x_train_sessions, y_train, x_val_loader, x_val_sessions, y_val
+
+def create_loader_train(
+    x_dict_train:dict,
+    y_train:pd.DataFrame,
+    x_dict_val:dict,
+    y_val:pd.DataFrame,
+):
+    x_train = [x_dict_train[i] for i in y_train.index]
+    x_train = torch.stack(x_train)
+    
+    x_val = [x_dict_val[i] for i in y_val.index]
+    x_val = torch.stack(x_val)
+    
+    train_loader = DataLoader(
+        TensorDataset(x_train, torch.Tensor(y_train.values)),
+        batch_size=CFG.BATCH_SIZE, shuffle=True, num_workers=4,
+    )
+
+    val_loader = DataLoader(
+        TensorDataset(x_val, torch.Tensor(y_val.values)),
+        batch_size=CFG.BATCH_SIZE, shuffle=True, num_workers=4,
+    )
 
     return train_loader, val_loader
 
@@ -432,30 +470,47 @@ def create_loader_test(
 
 # ### PretrainModel
 
+# #### Augmentation Functions
+
 # +
+def cutmix(x:torch.Tensor, m:float=.1):
+    x = x.clone()
+    batch_size, filter_size, *others = x.shape
+    x_shuffle = x[torch.randperm(batch_size)]
+    random_choice = torch.from_numpy(
+        np.random.choice(
+            2,
+            ([batch_size, filter_size]+others),
+            p=[m,1-m]
+        )
+    )
+    x[random_choice==0] = x_shuffle[random_choice==0]
+    return x
+
+def mixup(x:torch.Tensor, alpha:float=.2):
+    x = x.clone()
+    index = torch.randperm(x.shape[0])
+    x = alpha*x + (1-alpha)*x[index, :]
+    return x
+
+
+# -
+
+# #### Pretraining Orchestrator
+
 class PretrainModel(nn.Module):
     def __init__(
         self,
         num_total_tokens:int,
         num_continuous:int,
+        categories:list,
         filter_size:int=10,
         num_features:int=11,
         dim:int=32,
         num_outputs_projection_head:int=128,
         heads:int=8,
         dim_head:int=16,
-        attention_dropout:float=.1,
-        real_space_aug_func=None, # cutmix?
-        latent_space_aug_func=None, # mixup?
-        pretrain_label_continuous:str="elapsed_time",
-        continuous_features:list=[
-            'elapsed_time',
-            'hover_duration',
-            'distance_room',
-            'distance_screen'
-        ],
-        temperature=0.7,
-        num_negative_keys:int=2**16
+        attention_dropout:float=.05,
     ):
         super(PretrainModel, self).__init__()
         self.encoder = Encoder(
@@ -468,126 +523,138 @@ class PretrainModel(nn.Module):
             heads=heads,
             dim_head=dim_head,
             attention_dropout=attention_dropout,
-            real_space_aug_func=None,
-            latent_space_aug_func=None
         )
-        self.momentum_encoder = Encoder(
-            num_total_tokens=num_total_tokens,
-            num_continuous=num_continuous,
+        
+        self.categories = categories
+        self.filter_size = filter_size
+        self.num_outputs_projection_head = num_outputs_projection_head
+        self.predictor_sim = nn.Sequential(
+            nn.Linear(num_outputs_projection_head, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_outputs_projection_head)
+        )
+        self.predictor_fve_cat = nn.Sequential(
+            nn.Linear(num_features*dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 12),
+            nn.Sigmoid()
+        )
+        self.future_records_prediction = FutureRecordsPrediction(
+            encoder=self.encoder,
             filter_size=filter_size,
             num_features=num_features,
-            dim=dim,
-            num_outputs=num_outputs_projection_head,
-            heads=heads,
-            dim_head=dim_head,
-            attention_dropout=attention_dropout,
-            real_space_aug_func=real_space_aug_func,
-            latent_space_aug_func=latent_space_aug_func
+            dim=dim
         )
-        
-        for param, param_m in zip(
-            self.encoder.parameters(),
-            self.momentum_encoder.parameters()
-        ):
-            param_m.data.copy_(param_m.data)
-            param_m.requires_grad=True
-            
-        self.pretrain_label_continuous_idx = continuous_features.index(pretrain_label_continuous)
-
-        self.temperature = temperature
-        self.num_negative_keys = num_negative_keys
-        
-        self.register_buffer(
-            "queue",
-            torch.randn(num_outputs_projection_head, num_negative_keys).to(CFG.DEVICE)
-        )
-        self.queue = F.normalize(self.queue, dim=0)
-        self.register_buffer("queue_pointer", torch.zeros(1, dtype=torch.int64).to(CFG.DEVICE))
-            
-    @torch.no_grad()
-    def _update_mencoder(self, m:float=.999):
-        for param, param_m in zip(
-            self.encoder.parameters(),
-            self.momentum_encoder.parameters()
-        ):
-            param_m.data = param.data*m + param.data*(1-m)
 
     @torch.no_grad()
-    def _dequeue_and_enqueue(self, key):
-        batch_size = key.shape[0]
-        if self.num_negative_keys % batch_size == 0:
-            pointer = int(self.queue_pointer)
-
-            # replace the keys at pointer (dequeue and enqueue)
-            self.queue[:, pointer:(pointer+batch_size)] = key.t()
-            pointer = (pointer + batch_size) % self.num_negative_keys  # move pointer
-            self.queue_pointer[0] = pointer
-            
-    @torch.no_grad()
-    def _make_label(self, x_categorical, x_continuous):
+    def _make_label(self, x_categorical, category_index:int=0):
+        num_classes=self.categories[category_index]+1
+        mini = torch.min(x_categorical[:,:,category_index])
         label_categorical = F.one_hot(
-            x_categorical[:,:,0].to(torch.int64),
-            num_classes=torch.unique(x_categorical[:,:,0]).shape[0]
-        ).to(torch.int8)
-        label_continuous = x_continuous[:, self.pretrain_label_continuous_idx]
-        return label_categorical, label_continuous
+            x_categorical[:,:,category_index].to(torch.int64)-mini,
+            num_classes=num_classes
+        ).to(torch.float32)
+        label_categorical = label_categorical.view(-1, num_classes)
+        x_categorical[:,:,category_index] = 0
+        x_fve = x_categorical
+        return label_categorical, x_fve
     
     def forward(
         self,
         x_categorical:torch.Tensor,
         x_continuous:torch.Tensor,
-        pretrain_mode:bool=False
+        real_space_aug_func=cutmix,
+        latent_space_aug_func=mixup
     ):
-        query = self.encoder(x_categorical.clone(), x_continuous.clone())
-        query = F.normalize(query, dim=1)
-
-        with torch.no_grad():            
-            if pretrain_mode:
-                label_categorical, label_continuous = self._make_label(
-                    x_categorical.clone(),
-                    x_continuous.clone()
-                )
-            self._update_mencoder()
-            key = self.momentum_encoder(x_categorical.clone(), x_continuous.clone())
-            key = F.normalize(key, dim=1)
-            
-        l_pos = torch.einsum("nc,nc->n", [query, key]).unsqueeze(-1)
-        l_neg = torch.einsum("nc,ck->nk", [query, self.queue.clone().detach()])
-        logits = torch.cat([l_pos, l_neg], dim=1)
-        logits /= self.temperature
-        targets = torch.zeros(logits.shape[0], dtype=torch.int64).to(CFG.DEVICE)
-        loss = F.cross_entropy(logits, targets, reduction="mean")
-        self._dequeue_and_enqueue(key)
+        ## contrastive learning
+        x = self.encoder(x_categorical.clone(), x_continuous.clone())
+        x = F.normalize(x, dim=1)
+        xp = self.predictor_sim(x)
         
-        return loss
-
-class Constrastive(nn.Module):
-    def __init__(self, num_features, dim=32):
-        super(Constrastive, self).__init__()
-        units = [
-            dim*num_features,
-            6*dim*num_features//5,
-            dim*num_features//2
-        ]
-        self.projection_head_true = MLP(units)
-        self.projection_head_false = MLP(units)
-        self.reshaping = lambda x: (x / x.norm(dim=-1, keepdim=True)).flatten(1,2)
-        self.temperature = temperature
+        x_ = self.encoder(
+            x_categorical.clone(),
+            x_continuous.clone(),
+            real_space_aug_func=real_space_aug_func,
+            latent_space_aug_func=latent_space_aug_func
+        )
+        x_ = F.normalize(x_, dim=1)
+        xp_ = self.predictor_sim(x_)
         
-    def forward(self, x_true, x_false):
-        x_true, x_false = self.reshaping(x_true), self.reshaping(x_false)
-        x_true = F.normalize(self.projection_head_true(x_true), dim=-1).flatten(1)
-        x_false = F.normalize(self.projection_head_false(x_false), dim=-1).flatten(1)  
-        logits = x_true @ x_false.t() / self.temperature
-        logits_ =  x_false @ x_true.t() / self.temperature
-        targets = torch.arange(logits.size(0)).to(CFG.DEVICE)
-        loss = F.cross_entropy(logits, targets, reduction="mean")
-        loss_ = F.cross_entropy(logits_, targets, reduction="mean")
-        loss = (loss + loss_) / 2
-        return loss
+        loss = -F.cosine_similarity(x.detach(), xp_)
+        loss_ =  -F.cosine_similarity(x_.detach(), xp)        
+        loss = torch.mean((loss + loss_) / 2.0) + 1 # make loss a positive number
+        
+        ## feature vector estimation: fve
+        label_categorical, x_fve = self._make_label(x_categorical.clone())
+        
+        # estimation categorical feature
+        x_fve = self.encoder.embedding(x_fve, x_continuous.clone())
+        x_fve = torch.concat(x_fve, dim=2)
+        x_fve = self.encoder.column_attention(x_fve)
+        x_fve = self.encoder.time_series_attention(x_fve)
+        x_fve = x_fve.flatten(2)
+        x_fve = x_fve.view(-1, x_fve.shape[-1])
+        x_fve = self.predictor_fve_cat(F.normalize(x_fve.flatten(1), dim=1))
+        loss_fve_cat = F.cross_entropy(x_fve, label_categorical, reduction="mean")
+        
+        ## future records estimation
+        x_frp = self.encoder.embedding(x_categorical.clone(), x_continuous.clone())
+        x_frp = torch.concat(x_frp, dim=2)
+        x_frp = self.encoder.column_attention(x_frp)
+        x_frp = self.encoder.time_series_attention(x_frp)
+        loss_frp = self.future_records_prediction(x_frp)
+                    
+        return loss, loss_fve_cat, loss_frp
 
 
-# -
+# #### Future Records Prediction
+
+class FutureRecordsPrediction(nn.Module):
+    def __init__(
+        self,
+        encoder:nn.Module,
+        filter_size:int,
+        num_features:int,
+        dim:int
+    ):
+        super(FutureRecordsPrediction, self).__init__()
+        self.first_half = nn.Sequential(
+            nn.Linear(int(filter_size/2*num_features*dim), 512),
+            nn.ReLU(),
+            nn.Linear(512, 32),
+            nn.ReLU()
+        )
+        self.second_half = nn.Sequential(
+            nn.Linear(int(filter_size/2*num_features*dim), 512),
+            nn.ReLU(),
+            nn.Linear(512, 32),
+            nn.ReLU()
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(64, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x_frp:torch.Tensor):
+        first_half, second_half = x_frp.chunk(2, dim=1)
+        first_half, second_half = first_half.flatten(1), second_half.flatten(1)
+
+        first_half_mlp = self.first_half(first_half.clone())
+        first_half_mlp_ = self.first_half(second_half.clone())
+        second_half_mlp = self.second_half(second_half.clone())
+        second_half_mlp_ = self.second_half(first_half.clone())
+        
+        pred = self.classifier(torch.concat([first_half_mlp, second_half_mlp], dim=1))
+        loss = F.binary_cross_entropy(pred, torch.ones(pred.shape).to(CFG.DEVICE))
+        pred_ = self.classifier(torch.concat([first_half_mlp_, second_half_mlp_], dim=1))
+        loss_ = F.binary_cross_entropy(pred_, torch.zeros(pred_.shape).to(CFG.DEVICE))
+        
+        return (loss + loss_) / 2.0
+
+
+# #### Encoder
 
 class Encoder(nn.Module):
     def __init__(
@@ -601,17 +668,12 @@ class Encoder(nn.Module):
         heads:int=8,
         dim_head:int=16,
         attention_dropout:float=.1,
-        real_space_aug_func=None, # cutmix?
-        latent_space_aug_func=None, # mixup?
     ):
         super(Encoder, self).__init__()
         self.num_total_tokens = num_total_tokens
         self.num_continuous = num_continuous
         self.dim = dim
         
-        self.real_space_aug_func = real_space_aug_func
-        self.latent_space_aug_func = latent_space_aug_func
-
         self.embedding = Embedding(num_total_tokens, num_continuous, filter_size, dim)
         self.column_attention = Attention(dim, heads, dim_head, attention_dropout)
         self.time_series_attention = Attention(dim, heads, dim_head, attention_dropout)
@@ -621,15 +683,17 @@ class Encoder(nn.Module):
         self,
         x_categorical:torch.Tensor,
         x_continuous:torch.Tensor,
+        real_space_aug_func=None, # cutmix?
+        latent_space_aug_func=None, # mixup?
     ):        
-        if self.real_space_aug_func:
-            x_categorical = self.real_space_aug_func(x_categorical)
-            x_continuous = self.real_space_aug_func(x_continuous)
+        if real_space_aug_func:
+            x_categorical = real_space_aug_func(x_categorical)
+            x_continuous = real_space_aug_func(x_continuous)
         
         x = torch.concat(self.embedding(x_categorical, x_continuous), dim=2)
 
-        if self.latent_space_aug_func:
-            x = self.latent_space_aug_func(x)
+        if latent_space_aug_func:
+            x = latent_space_aug_func(x)
     
         x = self.column_attention(x)
         x = torch.permute(x, (0,2,1,3))
@@ -639,6 +703,8 @@ class Encoder(nn.Module):
         
         return x
 
+
+# #### Embedding
 
 # +
 class Embedding(nn.Module):
@@ -718,6 +784,8 @@ class ProjectingContinuous(nn.Module):
 
 # -
 
+# #### Attention
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -734,6 +802,7 @@ class Attention(nn.Module):
         self.query = nn.Linear(dim, dim_head*heads, bias=False)
         self.value = nn.Linear(dim, dim_head*heads, bias=False)
         self.out = nn.Linear(dim_head*heads, dim)
+        self.dropout = dropout
         
     def forward(self, x):
         # x.shape -> batch_size, filter_size, num_features, dim=32
@@ -751,6 +820,7 @@ class Attention(nn.Module):
         attention = torch.einsum('bhsid, bhsjd -> bhsij', (query, key))
         attention /= self.dim_head**0.5
         attention = attention.softmax(dim=-1)
+        attention = F.dropout(attention, self.dropout, training=self.training)
         attention = torch.einsum('bhsij, bhsjd -> bhsid', (attention, value))
 
         # attention.shape -> batch_size, filter_size, num_features, dim_head*heads=128
@@ -761,6 +831,8 @@ class Attention(nn.Module):
 
         return attention
 
+
+# #### Projection Head
 
 class ProjectionHead(nn.Module):
     def __init__(
@@ -788,155 +860,64 @@ class ProjectionHead(nn.Module):
         return x
 
 
-# ### Augmentation Functions
-
-# +
-def cutmix(x:torch.Tensor, m:float=.1):
-    x = x.clone()
-    batch_size, filter_size, *others = x.shape
-    x_shuffle = x[torch.randperm(batch_size)]
-    random_choice = torch.from_numpy(
-        np.random.choice(
-            2,
-            ([batch_size, filter_size]+others),
-            p=[m,1-m]
-        )
-    )
-    x[random_choice==0] = x_shuffle[random_choice==0]
-    return x
-
-def mixup(x:torch.Tensor, alpha:float=.1):
-    x = x.clone()
-    index = torch.randperm(x.shape[0])
-    x = alpha*x + (1-alpha)*x[index, :]
-    return x
-
-
-# -
-
 # ### MultiOutputsModel
 
 # +
 class MultiOutputsModel(nn.Module):
-    def __init__(self, num_features=10, num_outputs=10,
-                 units=[64, 128, 64, 64, 32],
-                 units_sub=[16, 32, 16, 8, 1],
-                 pretrained_model=None,
-                 dim=None
-                ):
+    def __init__(
+        self,
+        num_inputs:int=128,
+        num_outputs:int=10,
+        units:list=[64, 128, 64, 32],
+        units_sub:list=[16, 32, 8, 1],
+    ):
         super(MultiOutputsModel, self).__init__()
         self.name = "MultiOutputsModel"
-        self.num_features = num_features
-        self.dim = dim
+        self.num_inputs = num_inputs
         self.num_outputs = num_outputs
         
-        if pretrained_model:
-            self.embedding = pretrained_model.embedding
-            self.saint = pretrained_model.saint
-            
-            self.each_dim_models =  nn.ModuleList([
-                EachSAINTDimModel(
-                    num_features=num_features,
-                    num_outputs=num_outputs,
-                    units=units,
-                    units_sub=units_sub,
-                    dim=dim
-                )
-                for _ in range(dim)
-            ])
-            
-            self.last_output_layers = nn.ModuleList([
-                SigmoidLayer(dim, 1) for _ in range(num_outputs)
-            ])
+        units = [num_inputs] + units
         
-    def register_pretrained_model(self, pretrained_model):
-        for param in pretrained_model.parameters():
-            param.requires_grad = False
-        self.__init__(
-            num_features=pretrained_model.embedding.num_features,
-            dim=pretrained_model.dim,
-            num_outputs=self.num_outputs,
-            pretrained_model=pretrained_model,
-        )
-        
-    def forward(self, x, x_mask):
-        x = self.embedding(x.clone(), x_mask.clone())
-        x = self.saint(x)
-        #x = torch.mean(x, dim=1) #x[:,0,:]
-
-        dim_outputs = []
-        for i_dim, l in enumerate(self.each_dim_models):
-            dim_outputs.append(l(x[:,:,i_dim].clone()))
-        x = torch.stack(dim_outputs)
-        x = torch.transpose(x, 0, 1)
-        
-        last_outputs = []
-        for i_output, l in enumerate(self.last_output_layers):
-            last_outputs.append(l(x[:,:,i_output].clone()))
-            
-        x = torch.concat(last_outputs, dim=1)
-        return x
-
-class EachSAINTDimModel(nn.Module):
-    def __init__(self, num_features=10, num_outputs=10,
-                 units=[128, 256, 128, 64, 32],
-                 units_sub=[64, 16, 32, 16, 1],
-                 dim=None
-                ):
-        super(EachSAINTDimModel, self).__init__()
-        self.num_features = num_features
-        self.dim = dim
-        self.units = [self.num_features] + units
-        self.units_sub = [self.units[-1]] + units_sub
-        
-        self.l1_bn = nn.BatchNorm1d(self.units[0])
-        self.l1 = nn.Linear(self.units[0], self.units[1])
-        nn.init.xavier_normal_(self.l1.weight)
-        
-        self.ls = nn.ModuleList([
-            LeakyReLULayer(self.units[i+1], self.units[i+2])
-            if i%2 == 1 else ResidualBlock(self.units[i+1], self.units[i+2])
-            for i in range(len(self.units)-2)
+        self.main_mlp = nn.ModuleList([
+            ResidualBlock(units[i], units[i+1])
+            for i in range(len(units)-1)
         ])
-        self.num_outputs = num_outputs
-        
-        self.subs = nn.ModuleList([
-            MultiOutputsModelSub(self.units[-1])
+
+        self.last_output_layers = nn.ModuleList([
+            MultiOutputsModelSub(units[-1], units_sub=[16, 8, 1])
             for _ in range(num_outputs)
         ])
         
     def forward(self, x):
-        x = F.leaky_relu(self.l1(self.l1_bn(x)))
-        x = F.dropout(x, .1, training=self.training)
-        for l in self.ls:
+        for l in self.main_mlp:
             x = l(x)
-
-        res = []
-        for sub in self.subs:
-            res.append(sub(x.clone()))            
-        x = torch.concat(res, dim=1)
         
+        last_outputs = []
+        for l in self.last_output_layers:
+            last_outputs.append(l(x.clone()))
+            
+        x = torch.concat(last_outputs, dim=1)
         return x
     
 class MultiOutputsModelSub(nn.Module):
-    def __init__(self, num_inputs, units_sub=[64, 16, 32, 16, 1]):
+    def __init__(self, num_inputs, units_sub=[16, 8, 1]):
         super(MultiOutputsModelSub, self).__init__()
         self.geglu_layer = GeGLULayer(num_inputs, units_sub[0])
         self.units_sub = units_sub
         self.ls_sub =  nn.ModuleList([
-            LeakyReLULayer(self.units_sub[i], self.units_sub[i+1])
-            if i < len(self.units_sub)-1 else
-            SigmoidLayer(self.units_sub[i], self.units_sub[i+1])
-            for i in range(len(self.units_sub)-1)
+            LeakyReLULayer(units_sub[i], units_sub[i+1])
+            if i < len(units_sub)-2 else
+            SigmoidLayer(units_sub[i], units_sub[i+1])
+            for i in range(len(units_sub)-1)
         ])
                 
     def forward(self, x):
         x = self.geglu_layer(x)
         for i, l in enumerate(self.ls_sub):
-            if i+1 < len(self.units_sub)-1:
+            if i+1 < len(self.units_sub)-2:
                 x = l(x)
             else:
-                x = F.dropout(x, .2, training=self.training)
+                x = F.dropout(x, .1, training=self.training)
                 x = l(x)
         return x
 
@@ -961,13 +942,30 @@ class SigmoidLayer(nn.Module):
         x = self.linear(self.bn(x))
         x = F.sigmoid(x)
         return x
+     
+class GeGLULayer(nn.Module):
+    def __init__(self, num_inputs, num_outputs):
+        super(GeGLULayer, self).__init__()
+        self.bn = nn.BatchNorm1d(num_inputs)
+        self.linear = nn.Linear(num_inputs, num_outputs*2)
+        self.geglu = GeGLU()
+                
+    def forward(self, x):
+        x = self.linear(self.bn(x))
+        x = self.geglu(x)
+        return x
 
+class GeGLU(nn.Module):
+    def forward(self, x):
+        x, gates = x.chunk(2, dim=-1)
+        return x*F.gelu(gates)
+    
 class ResidualBlock(nn.Module):
     def __init__(self, num_inputs, num_outputs):
         super(ResidualBlock, self).__init__()
-        self.layer1 = LeakyReLULayer(num_inputs, 32)
-        self.layer2 = LeakyReLULayer(32, 16)
-        self.layer3 = LeakyReLULayer(16, num_inputs)
+        self.layer1 = LeakyReLULayer(num_inputs, 64)
+        self.layer2 = LeakyReLULayer(64, 32)
+        self.layer3 = LeakyReLULayer(32, num_inputs)
         self.geglu = GeGLULayer(num_inputs, num_outputs)
                 
     def forward(self, x):
@@ -976,340 +974,172 @@ class ResidualBlock(nn.Module):
         x += self.layer3(x_mlp)
         x = self.geglu(x)
         return x
-    
-class GeGLULayer(nn.Module):
-    def __init__(self, num_inputs, num_outputs):
-        super(GeGLULayer, self).__init__()
-        self.bn = nn.BatchNorm1d(num_inputs)
-        self.linear = nn.Linear(num_inputs, num_outputs*2)
-        self.geglu = GEGLU()
-                
-    def forward(self, x):
-        x = self.linear(self.bn(x))
-        x = self.geglu(x)
-        return x
 
 
 # -
-
-# ### SAINT
-
-# +
-class MLP(nn.Module):
-    def __init__(self, three_dim):
-        super(MLP, self).__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(three_dim[0], three_dim[1]),
-            nn.ReLU(),
-            nn.Linear(three_dim[1], three_dim[2])
-        )
-        
-    def forward(self, x):
-        if len(x.shape)==1:
-            x = x.view(x.size(0), -1)
-        x = self.layers(x)
-        return x
-
-class EmbeddingLayer(nn.Module):
-    def __init__(self, num_features, dim=32):
-        super(EmbeddingLayer, self).__init__()
-        self.dim = dim
-        self.num_features = num_features
-        self.MLPs = nn.ModuleList([MLP([1, 100, dim]) for _ in range(num_features)])
-        mask_offset = F.pad(
-            torch.Tensor(num_features).fill_(2).type(torch.int8),
-            (1,0),
-            value=0
-        ).cumsum(dim=-1)[:-1].to(CFG.DEVICE)
-        self.register_buffer('mask_offset', mask_offset)
-        self.embedding_mask = nn.Embedding(num_features*2, dim)
-        
-    def forward(self, x, x_mask):
-        x_enc = torch.empty(*x.shape, self.dim).to(CFG.DEVICE)
-        for i in range(self.num_features):
-            x_enc[:,i,:] = self.MLPs[i](x[:,i])
-        x_enc[x_mask==0] = self.embedding_mask(x_mask+self.mask_offset.type_as(x_mask))[x_mask==0]
-        return x_enc
-    
-class SAINT(nn.Module):
-    def __init__(self, num_features, dim=32, heads=8, dim_head=16, attention_dropout=.1, ff_dropout=.1):
-        super(SAINT, self).__init__()
-        self.msa = Attention(dim, heads, dim_head, attention_dropout)
-        self.ff1 = FeedForward(dim, dropout=ff_dropout)
-        self.misa = Attention(dim*num_features, heads, 64, attention_dropout)
-        self.ff2 = FeedForward(dim*num_features, dropout=ff_dropout)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim*num_features)
-        self.norm4 = nn.LayerNorm(dim*num_features)
-        
-    def forward(self, x):
-        shape = x.shape
-        
-        x = self.norm1(x)
-        x += self.msa(x.clone())
-        
-        x = self.norm2(x)
-        x += self.ff1(x.clone())
-        x = x.view(1, shape[0], -1)
-        
-        x = self.norm3(x)
-        x += self.misa(x.clone())
-        
-        x = self.norm4(x)
-        x += self.ff2(x.clone())
-        x = x.view(*shape)
-        
-        return x
-
-class Attention(nn.Module):
-    def __init__(self, dim=32, heads=8, dim_head=16, dropout=0.1):
-        super().__init__()
-        inner_dim = dim_head * heads
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-        self.reshaping = lambda x, shape: torch.permute(x, (0,2,1)).reshape(shape[0], heads, shape[1], -1)
-        self.to_qkv = nn.Linear(dim, inner_dim*3, bias=False)
-        self.to_out = nn.Linear(inner_dim, dim)
-
-    def forward(self, x):
-        q, k, v = self.to_qkv(x).chunk(3, dim =-1)
-        shape = q.shape
-        q, k, v = self.reshaping(q, shape), self.reshaping(k, shape), self.reshaping(v, shape)
-        sim = torch.einsum('b h i d, b h j d -> b h i j', (q,k)) * self.scale
-        attention = sim.softmax(dim=-1)
-        out = torch.einsum('b h i j, b h j d -> b h i d', attention, v)
-        out_shape = out.shape
-        out = out.view(out_shape[0], out_shape[2], -1)
-        out = self.to_out(out)
-        return out
-
-class FeedForward(nn.Module):
-    def __init__(self, dim=32, mult=4, dropout=.1):
-        super(FeedForward, self).__init__()
-        self.linear1 = nn.Linear(dim, dim*mult*2)
-        self.linear2 = nn.Linear(dim*mult, dim)
-        self.dropout = dropout
-        self.geglu = GEGLU()
-        
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.geglu(x)
-        x = F.dropout(x, self.dropout, training=self.training)
-        x = self.linear2(x)
-        return x
-    
-class GEGLU(nn.Module):
-    def forward(self, x):
-        x, gates = x.chunk(2, dim=-1)
-        return x*F.gelu(gates)
-    
-class Constrastive(nn.Module):
-    def __init__(self, num_features, dim=32, temperature=0.7):
-        super(Constrastive, self).__init__()
-        units = [
-            dim*num_features,
-            6*dim*num_features//5,
-            dim*num_features//2
-        ]
-        self.projection_head_true = MLP(units)
-        self.projection_head_false = MLP(units)
-        self.reshaping = lambda x: (x / x.norm(dim=-1, keepdim=True)).flatten(1,2)
-        self.temperature = temperature
-        
-    def forward(self, x_true, x_false):
-        x_true, x_false = self.reshaping(x_true), self.reshaping(x_false)
-        x_true = F.normalize(self.projection_head_true(x_true), dim=-1).flatten(1)
-        x_false = F.normalize(self.projection_head_false(x_false), dim=-1).flatten(1)  
-        logits = x_true @ x_false.t() / self.temperature
-        logits_ =  x_false @ x_true.t() / self.temperature
-        targets = torch.arange(logits.size(0)).to(CFG.DEVICE)
-        loss = F.cross_entropy(logits, targets, reduction="mean")
-        loss_ = F.cross_entropy(logits_, targets, reduction="mean")
-        loss = (loss + loss_) / 2
-        return loss
-    
-class Denoising(nn.Module):
-    def __init__(self, num_features, dim=32):
-        super(Denoising, self).__init__()
-        self.num_features = num_features
-        self.MLPs = nn.ModuleList([
-            MLP([dim, dim*5, 1])
-            for i in range(num_features)
-        ])
-        
-    def forward(self, x, x_original):
-        x = [
-            self.MLPs[i](x[:,i,:])
-            for i in range(1, self.num_features) # except for CLS
-        ]
-        x = torch.cat(x,dim=1)
-        loss = F.mse_loss(x, x_original[:,1:], reduction="mean")
-        return loss
-
-
-# -
-
-# ### Pretraining Class
-
-class PretrainingSAINT(nn.Module):
-    def __init__(self, num_features, dim=32):
-        super(PretrainingSAINT, self).__init__()
-        self.dim = dim
-        self.embedding = EmbeddingLayer(num_features, dim)
-        self.saint = SAINT(num_features, dim)
-        self.contrastive = Constrastive(num_features, dim)
-        self.denoising = Denoising(num_features, dim)
-    
-    def cutmix(self, x, m=.1):
-        x = x.clone()
-        x_shuffle = x[torch.randperm(x.shape[0]),:]
-        random_choice = torch.from_numpy(np.random.choice(2,(x.shape),p=[m,1-m]))
-        x[random_choice==0] = x_shuffle[random_choice==0]
-        return x
-
-    def mixup(self, x_enc, alpha=.3):
-        index = torch.randperm(x_enc.shape[0])
-        x_enc = alpha*x_enc + (1-alpha)*x_enc[index, :]
-        return x_enc
-    
-    def forward(self, x, x_mask):
-        x_true = self.embedding(x.clone(), x_mask.clone())
-        x_true = self.saint(x_true)
-        
-        x_false = self.cutmix(x.clone())
-        x_false = self.embedding(x_false, x_mask.clone())
-        x_false = self.mixup(x_false)
-        x_false = self.saint(x_false)
-        
-        contrastive_loss = self.contrastive(x_true.clone(), x_false.clone())
-        denoising_loss = self.denoising(x_false.clone(), x.clone())
-        
-        return contrastive_loss, denoising_loss
-
 
 # ### Pretraining Function
 
-def pretraining(train_loader, level_group, epochs=CFG.EPOCHS, lambda1=.5, lambda2=10, omit=CFG.PRETRAINING_OMIT):
-    num_features = train_loader.dataset.tensors[0].shape[1]
-    model = PretrainingSAINT(num_features).to(CFG.DEVICE)
-    checkpoint_path = f"{CFG.CHECKPOINT_PATH}/pretrain_params_{level_group}.pth"
-    
-    if omit:
-        model.load_state_dict(torch.load(checkpoint_path))
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(),lr=0.0001)
-        losses = [10**10]
-        model.train()
+def pretraining(
+    pretrain_loader:DataLoader,
+    dp:DataProcessing,
+    level_group:str="0-4",
+    epochs:int=CFG.PRETRAIN_EPOCHS,
+    lambda1:float=1.0,
+    lambda2:float=1.0,
+    lambda3:float=1.0,
+    pretrain_loader_val:DataLoader=None,
+    pretrain_sessions:list=None,
+    pretrain_sessions_val:list=None,
+    omit:bool=False,
+    omit_data_dict:bool=False,
+    agg_func=torch.mean,
+):
+    pretrain_model = PretrainModel(
+        num_total_tokens=dp.num_total_tokens,
+        num_continuous=dp.num_continuous,
+        categories=dp.categories,
+        filter_size=dp.filter_size,
+        num_features=dp.num_features,
+        dim=32,
+        num_outputs_projection_head=128,
+        heads=8,
+        dim_head=16,
+        attention_dropout=.1,
+    ).to(CFG.DEVICE)
 
+    optimizer = torch.optim.AdamW(pretrain_model.parameters(),lr=0.003)
+    losses = [10**10]
+    checkpoint_path = f"{CFG.CHECKPOINT_PATH}/pretrain_params_{level_group}.pth"
+    pretrain_model.train()
+
+    if omit:
+        pretrain_model.load_state_dict(torch.load(checkpoint_path))
+    else:
         print("Pretraining is starting...") 
-        for epoch in tqdm(range(epochs)):
-            loss_sum = 0.0
-            contrastive_loss_sum = 0.0
-            denoising_loss_sum = 0.0
-            for i, (X, X_mask, _) in enumerate(train_loader):
-                X, X_mask = X.to(CFG.DEVICE), X_mask.to(CFG.DEVICE)
-                contrastive_loss, denoising_loss = model(X, X_mask)
-                loss = lambda1 * contrastive_loss + lambda2 * denoising_loss
+        for epoch in tqdm(range(CFG.PRETRAIN_EPOCHS)):
+            loss_sum, loss_fve_cat_sum, loss_frp_sum = 0.0, 0.0, 0.0
+            for i, (x_categorical, x_continuous) in enumerate(pretrain_loader):
+                x_categorical, x_continuous = x_categorical.to(CFG.DEVICE), x_continuous.to(CFG.DEVICE)
+                loss, loss_fve_cat, loss_frp = pretrain_model(x_categorical, x_continuous)
+                loss = lambda1*loss + lambda2*loss_fve_cat + lambda3*loss_frp
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-                contrastive_loss_sum += (lambda1 * contrastive_loss).item()
-                denoising_loss_sum += (lambda2 * denoising_loss).item()
                 loss_sum += loss.item()
+                loss_fve_cat_sum += loss_fve_cat.item()
+                loss_frp_sum += loss_frp.item()
 
-            epoch_loss = loss_sum/i
+            epoch_loss = (loss_sum + loss_fve_cat_sum + loss_frp)/i
             if epoch_loss < min(losses):
                 best_epoch = epoch
-                torch.save(model.state_dict(), checkpoint_path)
+                torch.save(pretrain_model.state_dict(), checkpoint_path)
             losses.append(epoch_loss)
 
-            print(
-                f"Epoch {epoch+1}/{epochs}: loss {epoch_loss: .4f} (contrastive_loss {contrastive_loss_sum/i: .4f}, denoising_loss {denoising_loss_sum/i: .4f})"
-            )
-
-        model.load_state_dict(torch.load(checkpoint_path))
+            print(f"Epoch {epoch+1}/{CFG.PRETRAIN_EPOCHS}: loss{epoch_loss: .4f} (contrastive{loss_sum/i: .4f}, fve_cat{loss_fve_cat_sum/i: .4f}, frp{loss_frp_sum/i: .4f})")
+        
+        pretrain_model.load_state_dict(torch.load(checkpoint_path))
         print(f"Pretraining has finished.\nBest Epoch is {best_epoch} with loss {min(losses)} !")
     
-    return model
-
-
-# ### Other Functions
-
-# +
-def calc_weight(data_loader):
-    count1 = torch.sum(data_loader.dataset.tensors[2], dim=0)
-    count_all = data_loader.dataset.tensors[2].shape[0]
-    count0 = count_all - count1
-    weight = count0 / count1
-    
-    del count1, count_all, count0
-    gc.collect()
-    
-    return weight
-
-def calc_matrix(x):
-    x = torch.where((x > CFG.THRESHOLD), 1, -1)
-    x_t = x.T
-    length = x_t.shape[0]
-    res = []
-
-    for i in range(length):
-        res.append(x *  x.T[i].unsqueeze(-1))
-    res = torch.concat(res, dim=1)
-    res = res.view(-1, length, length)
-    res = torch.where(res==-1, 0.0, 1.0)
-    res = torch.mean(res, axis=0).to(CFG.DEVICE)
+    if pretrain_sessions:
+        agg_func_str = "mean" if agg_func==torch.mean else "sum" if agg_func==torch.sum else None 
+        pretrain_model.eval()
         
-    return res
+        if omit_data_dict:
+            with open(f"{CFG.CHECKPOINT_PATH}/x_dict_train_{level_group}_{agg_func_str}.pickle", "rb") as f:
+                x_dict_train = pickle.load(f)
+            with open(f"{CFG.CHECKPOINT_PATH}/x_dict_val_{level_group}_{agg_func_str}.pickle", "rb") as f:
+                x_dict_val = pickle.load(f)
+        else:
+            x_train = []
+            for x_categorical, x_continuous in pretrain_loader:
+                x_categorical, x_continuous = x_categorical.to(CFG.DEVICE), x_continuous.to(CFG.DEVICE)
+                x_train += [pretrain_model.encoder(x_categorical, x_continuous).detach().cpu()]
+            
+            x_train = torch.concat(x_train, dim=0)
+            session_before = pretrain_sessions[0]
+            x_dict_train = {session_before:[]}
+            length = len(pretrain_sessions)-1
+            for i, (session, data) in enumerate(zip(pretrain_sessions, x_train)):
+                if i == length:
+                    x_dict_train[session] += [data]                    
+                    x_dict_train[session] = torch.mean(
+                        torch.stack(x_dict_train[session]),
+                        dim=0
+                    )*len(x_dict_train[session])**.2
+                else:
+                    if session_before != session:
+                        x_dict_train[session_before] = agg_func(
+                            torch.stack(x_dict_train[session_before]),
+                            dim=0
+                        )*len(x_dict_train[session_before])**.2
+                        x_dict_train[session] = []
+                        session_before = session
 
-def explore_threshold(model, val_loader):
-    preds, true_values = [], []
-    for i, (x, x_mask, t) in enumerate(val_loader):
-        x, x_mask, t = x.to(CFG.DEVICE), x_mask.to(CFG.DEVICE), t.to(CFG.DEVICE)
-        y = model(x, x_mask).view(-1)
-        preds += y
-        true_values += t
+                    x_dict_train[session] += [data]
+                
+            x_val = []
+            for x_categorical, x_continuous in pretrain_loader_val:
+                x_categorical, x_continuous = x_categorical.to(CFG.DEVICE), x_continuous.to(CFG.DEVICE)
+                x_val += [pretrain_model.encoder(x_categorical, x_continuous).detach().cpu()]
+            
+            x_val = torch.concat(x_val, dim=0)
+            session_before = pretrain_sessions_val[0]
+            x_dict_val = {session_before:[]}
+            length = len(pretrain_sessions_val)-1
+            for i, (session, data) in enumerate(zip(pretrain_sessions_val, x_val)):
+                if i == length:
+                    x_dict_val[session] += [data]                    
+                    x_dict_val[session] = agg_func(
+                        torch.stack(x_dict_val[session]),
+                        dim=0
+                    )*len(x_dict_val[session])**.2
+                else:
+                    if session_before != session:
+                        x_dict_val[session_before] = torch.mean(
+                            torch.stack(x_dict_val[session_before]),
+                            dim=0
+                        )*len(x_dict_val[session_before])**.2
+                        x_dict_val[session] = []
+                        session_before = session
 
-    preds = torch.stack(preds).view(-1).detach().cpu().numpy()
-    true_values = torch.stack(true_values).view(-1).detach().cpu().numpy()
-    px.box(x=true_values, y=preds, points="all").show()
+                    x_dict_val[session] += [data]
+                
+            del x_train, x_val
+            gc.collect()
 
-    f1s = []
-    for th in range(0, 101, 1):
-        f1 = f1_score(true_values, (preds > (th/100)).astype(int), average="macro")
-        f1s.append(f1)
-    f1s = pd.DataFrame({"threshold":[i/100 for i in range(0, 101, 1)], "f1":f1s}).set_index("threshold")
-    best_threshold = f1s[f1s.f1.apply(lambda x: x//.01)==f1s.f1.apply(lambda x: x//.01).max()].index.max()
-    px.line(f1s, title=f"Best Threshold is {best_threshold}.").show()
+            with open(f"{CFG.CHECKPOINT_PATH}/x_dict_train_{level_group}_{agg_func_str}.pickle", "wb") as f:
+                pickle.dump(x_dict_train, f)
+            with open(f"{CFG.CHECKPOINT_PATH}/x_dict_val_{level_group}_{agg_func_str}.pickle", "wb") as f:
+                pickle.dump(x_dict_val, f)
+        
+        return pretrain_model, x_dict_train, x_dict_val
+    
+    else:
+        return pretrain_model
 
-    return best_threshold
-
-
-# -
 
 # ### Training Function
 
-def training(train_loader, val_loader, model_class, pretrained_model, omit=CFG.TRAINING_OMIT):
-    num_features = train_loader.dataset.tensors[0].shape[1]
-    num_outputs = val_loader.dataset.tensors[2].shape[1]
-    level_group = '0-4' if num_outputs == 3 else '5-12' if num_outputs == 10 else '13-22' if num_outputs == 5 else None
-    model = model_class(num_features, num_outputs)
-    model.register_pretrained_model(pretrained_model)
-    model = model.to(CFG.DEVICE)
+def training(
+    train_loader:DataLoader,
+    val_loader:DataLoader,
+    model_class,
+    num_inputs:int,
+    level_group:str="0-4",
+    omit:bool=CFG.TRAINING_OMIT
+):
+    num_outputs = len(lq_dict[level_group])
+    model = model_class(num_inputs, num_outputs).to(CFG.DEVICE)
     checkpoint_path = f"{CFG.CHECKPOINT_PATH}/{model.name}_bestmodel{'_'+level_group if level_group else ''}{'_all' if CFG.PREDICT_ALL else ''}.pth"
     
     if omit:
         checkpoint_path = f"{CFG.CHECKPOINT_PATH}/{model.name}_bestmodel{'_'+level_group if level_group else ''}{'_all' if CFG.PREDICT_ALL else ''}.pth"
         model.load_state_dict(torch.load(checkpoint_path))
-        try:
-            with open(f"{CFG.CHECKPOINT_PATH}/{model.name}_thresholds{'_all' if CFG.PREDICT_ALL else ''}.pickle", "rb") as f:
-                best_thresholds = pickle.load(f)[level_group]
-        except Exception as e:
-            print(e)
-            best_thresholds = None
+        with open(f"{CFG.CHECKPOINT_PATH}/{model.name}_thresholds{'_all' if CFG.PREDICT_ALL else ''}.pickle", "rb") as f:
+            best_thresholds = pickle.load(f)[level_group]
         return model, best_thresholds
     else:
         print("Training is starting...") 
@@ -1317,25 +1147,34 @@ def training(train_loader, val_loader, model_class, pretrained_model, omit=CFG.T
         weight_ratio = calc_weight(train_loader).to(CFG.DEVICE)
         early_stopping_count = 0
         optimizer = torch.optim.Adam(model.parameters(), lr=CFG.LEARNING_RATE)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=.005)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=20,
+            eta_min=.005
+        )
         loss_trains, loss_vals, f1_trains, f1_vals = [], [], [], []
         loss_func = nn.BCELoss(reduction='none')
+        #loss_func_correct_rate = nn.MSELoss()
 
         for epoch in range(CFG.EPOCHS):
-            #"""
-            #train
-            #"""
             model.train()
-            loss_train = 0
+            loss_train = 0.0
             preds, true_values = [], []
-            for i, (x, x_mask, t) in enumerate(train_loader):
-                x, x_mask, t = x.to(CFG.DEVICE), x_mask.to(CFG.DEVICE), t.to(CFG.DEVICE)
-                y = model(x, x_mask)
+            for i, (x, t) in enumerate(train_loader):
+                x, t = x.to(CFG.DEVICE), t.to(CFG.DEVICE)
+                y = model(x)
                 preds += y
                 true_values += t
                 
                 weight = (lambda w: torch.where(w==0, 1, w))(t*weight_ratio)
                 loss = torch.mean(loss_func(y, t)*weight) / num_outputs
+                
+                #correct_rate = torch.mean(torch.where(y>CFG.THRESHOLD, 1, 0), dim=1)
+                #loss_correct_rate = loss_func_correct_rate(
+                #    correct_rate,
+                #    torch.mean(t, dim=1)
+                #)
+                
                 loss_train += loss.item()
 
                 optimizer.zero_grad()
@@ -1354,20 +1193,16 @@ def training(train_loader, val_loader, model_class, pretrained_model, omit=CFG.T
             #validation
             #"""
             model.eval()
-            loss_val = 0
+            loss_val = 0.0
             preds, true_values = [], []
-            for i, (x, x_mask, t) in enumerate(val_loader):
-                x, x_mask, t = x.to(CFG.DEVICE), x_mask.to(CFG.DEVICE), t.to(CFG.DEVICE)
-                y = model(x, x_mask)
+            for i, (x, t) in enumerate(val_loader):
+                x, t = x.to(CFG.DEVICE), t.to(CFG.DEVICE)
+                y = model(x)
                 preds += y
                 true_values += t
-
+                
                 weight = (lambda w: torch.where(w==0, 1, w))(t*weight_ratio)
-                try:
-                    loss = torch.mean(loss_func(y, t)*weight) / num_outputs
-                except Exception as e:
-                    print(y)
-                    return (x, x_mask, y,t,weight, loss_func, model), None
+                loss = torch.mean(loss_func(y, t)*weight) / num_outputs
                 loss_val += loss.item()
 
             loss_val /= i
@@ -1434,9 +1269,9 @@ def training(train_loader, val_loader, model_class, pretrained_model, omit=CFG.T
         #exploring best threshold
         #"""
         preds, true_values = [], []
-        for i, (x, x_mask, t) in enumerate(val_loader):
-            x, x_mask, t = x.to(CFG.DEVICE), x_mask.to(CFG.DEVICE), t.to(CFG.DEVICE)
-            y = model(x, x_mask).view(-1)
+        for i, (x, t) in enumerate(val_loader):
+            x, t = x.to(CFG.DEVICE), t.to(CFG.DEVICE)
+            y = model(x).view(-1)
             preds += y
             true_values += t
 
@@ -1466,9 +1301,9 @@ def training(train_loader, val_loader, model_class, pretrained_model, omit=CFG.T
         for epoch in range(epochs):
             loss_train = 0
             preds, true_values = [], []
-            for i, (x, x_mask, t) in enumerate(val_loader):
-                x, x_mask, t = x.to(CFG.DEVICE), x_mask.to(CFG.DEVICE), t.to(CFG.DEVICE)
-                y = model(x, x_mask)
+            for i, (x, t) in enumerate(val_loader):
+                x, t = x.to(CFG.DEVICE), t.to(CFG.DEVICE)
+                y = model(x)
                 preds += y
                 true_values += t
 
@@ -1501,6 +1336,7 @@ def training(train_loader, val_loader, model_class, pretrained_model, omit=CFG.T
                 if f1_train != 0:
                     torch.save(model.state_dict(), checkpoint_path)                  
 
+        torch.cuda.empty_cache()
         model.load_state_dict(torch.load(checkpoint_path))
 
         #"""
@@ -1580,80 +1416,59 @@ def predict(test, model, level_group=None, threshold=None, question=None):
     return submission
 
 
-# ### LightGBM for feature elimination
+# ### Other Functions
 
-def lgb_training(X, y, params=None, train_rate=.9):
+# +
+def calc_weight(data_loader):
+    count1 = torch.sum(data_loader.dataset.tensors[1], dim=0)
+    count_all = data_loader.dataset.tensors[1].shape[0]
+    count0 = count_all - count1
+    weight = count0 / count1
     
-    lgb_models = {}
-    lgb_preds = {}
-    lgb_scores = {}
-    fi_df = []
+    del count1, count_all, count0
+    gc.collect()
     
-    if params is None:
-        params = dict(
-            objective='binary',
-            metric='binary_logloss',
-            verbosity=1,
-            early_stopping_round=100,
-            random_state=CFG.SEED,
-            is_unbalance=True,
-            num_iterations=2000,
-            num_leaves=500,
-            lambda_l1=.2,
-            lambda_l2=.2,
-            bagging_freq=10,
-            bagging_seed=CFG.SEED,
-            force_col_wise=True
-        )
-    
-    for level_group in lq_dict.keys():
-        for q in lq_dict[level_group]:
-            X_train, X_val, y_train, y_val = tts(
-                X[level_group][0],
-                y[q],
-                train_size=train_rate,
-                random_state=CFG.SEED,
-                stratify=y[q]
-            )
-            lgb_train = lgb.Dataset(X_train, y_train)
-            lgb_val = lgb.Dataset(X_val, y_val)
+    return weight
 
-            del X_train, y_train
-            gc.collect()
+def calc_matrix(x):
+    x = torch.where((x > CFG.THRESHOLD), 1, -1)
+    x_t = x.T
+    length = x_t.shape[0]
+    res = []
 
-            lgb_model = lgb.train(
-                params=params,
-                train_set=lgb_train,
-                num_boost_round=1000,
-                valid_sets=(lgb_train, lgb_val),
-                callbacks=None,
-                verbose_eval=100
-            )
+    for i in range(length):
+        res.append(x *  x.T[i].unsqueeze(-1))
+    res = torch.concat(res, dim=1)
+    res = res.view(-1, length, length)
+    res = torch.where(res==-1, 0.0, 1.0)
+    res = torch.mean(res, axis=0).to(CFG.DEVICE)
+        
+    return res
 
-            lgb_models[q] = lgb_model
-            lgb_preds[q] = lgb_model.predict(X_val)
-            lgb_scores[q] = f1_score(y_val,
-                                     [int(p > CFG.THRESHOLD) for p in lgb_preds[q]],
-                                     average="macro")
+def explore_threshold(model, val_loader):
+    preds, true_values = [], []
+    for i, (x, t) in enumerate(val_loader):
+        x, t = x.to(CFG.DEVICE), t.to(CFG.DEVICE)
+        y = model(x).view(-1)
+        preds += y
+        true_values += t
 
-            fi_df.append(
-                pd.DataFrame(
-                    lgb_model.feature_importance(importance_type="gain"),
-                    index=X[level_group][0].columns,
-                    columns=[q]
-                )
-            )
+    preds = torch.stack(preds).view(-1).detach().cpu().numpy()
+    true_values = torch.stack(true_values).view(-1).detach().cpu().numpy()
+    px.box(x=true_values, y=preds, points="all").show()
 
-    fi_df = pd.concat(fi_df, axis=1)
-    
-    feature_elimination_dict = {}
-    for level_group in lq_dict.keys():
-        fe_cols = fi_df[lq_dict[level_group]].mean(axis=1).sort_values(ascending=False)
-        fe_cols = fe_cols.iloc[:30].index.tolist()
-        feature_elimination_dict[level_group] = fe_cols
-    
-    return lgb_models, lgb_preds, lgb_scores, fi_df, feature_elimination_dict
+    f1s = []
+    for th in range(0, 101, 1):
+        f1 = f1_score(true_values, (preds > (th/100)).astype(int), average="macro")
+        f1s.append(f1)
+    f1s = pd.DataFrame({"threshold":[i/100 for i in range(0, 101, 1)], "f1":f1s}).set_index("threshold")
+    best_threshold = f1s[f1s.f1.apply(lambda x: x//.01)==f1s.f1.apply(lambda x: x//.01).max()].index.max()
+    px.line(f1s, title=f"Best Threshold is {best_threshold}.").show()
 
+    return best_threshold
+
+
+# -
 
 # # Execution
 
@@ -1663,6 +1478,7 @@ def lgb_training(X, y, params=None, train_rate=.9):
 # %%time
 
 if CFG.SUBMISSION_MODE:
+    print("SUBMISSION_MODE")
     with open(f"{CFG.CHECKPOINT_PATH}/dp.pickle", "rb") as f:
         dp = pickle.load(f)
 
@@ -1679,16 +1495,30 @@ if CFG.SUBMISSION_MODE:
     with open(f"{CFG.CHECKPOINT_PATH}/{model.name}_thresholds{'_all' if CFG.PREDICT_ALL else ''}.pickle", "rb") as f:
         thresholds = pickle.load(f)
         
-else:
-    dp = DataProcessing(stride=10, filter_size=20)
-    x_categorical, x_continuous, session_index = dp.fit_transform(f"{CFG.INPUT}/train.csv")
-    x_categorical_test, x_continuous_test, session_index_test = dp.transform(f"{CFG.INPUT}/test.csv")
-    train_labels = dp.get_labels()
+elif CFG.RESUME:
+    print("RESUME_MODE")
+    dps = {}
+    with open(f"{CFG.CHECKPOINT_PATH}/datas.pickle", "rb") as f:
+        datas = pickle.load(f)
+    train_labels = datas["0-4"]["dp"].get_labels()
+    
+elif CFG.CHECKPOINT:
+    print("CHECKPOINT_MODE")
+    datas = {}
+    for i, level_group in enumerate(lq_dict.keys()):
+        dp = DataProcessing(level_group=level_group, stride=10, filter_size=20)
+        train = dp.fit_transform(f"{CFG.INPUT}/train.csv")
+        test = dp.transform(f"{CFG.INPUT}/test.csv")
+        # -> x_categorical, x_continuous, session_index
 
-    if CFG.CHECKPOINT:
-        with open(f"{CFG.CHECKPOINT_PATH}/dp.pickle", "wb") as f:
-            pickle.dump(dp, f)
+        if i==0:
+            train_labels = dp.get_labels()
 
+        datas[level_group] = dict(dp=dp, train=train, test=test)
+
+    with open(f"{CFG.CHECKPOINT_PATH}/datas.pickle", "wb") as f:
+        pickle.dump(datas, f)                
+        
     if False:
         check = train_labels.copy()
         res = {}
@@ -1708,71 +1538,8 @@ else:
         if CFG.CHECKPOINT:
             with open(f"{CFG.CHECKPOINT_PATH}/cooccurence_rate.pickle", "wb") as f:
                 pickle.dump(cooccurence_rate, f)
+
 # -
-
-train_loader, val_loader = create_loader_train(
-    x_categorical=x_categorical,
-    x_continuous=x_continuous,
-    y=train_labels,
-    session_index=session_index,
-    level_group=dp.level_group,
-    train_rate=.9,
-    predict_all=False
-)
-
-# +
-# %%time
-
-model = PretrainModel(
-    num_total_tokens=dp.num_total_tokens,
-    num_continuous=dp.num_continuous,
-    filter_size=dp.filter_size,
-    num_features=11,
-    dim=32,
-    num_outputs_projection_head=128,
-    heads=8,
-    dim_head=16,
-    attention_dropout=.1,
-    real_space_aug_func=cutmix,
-    latent_space_aug_func=mixup,
-    temperature=0.7,
-    num_negative_keys=2**16
-).to(CFG.DEVICE)
-
-optimizer = torch.optim.AdamW(model.parameters(),lr=0.003)
-losses = [10**10]
-model.train()
-level_group="0-4"
-checkpoint_path = f"{CFG.CHECKPOINT_PATH}/pretrain_params_{level_group}.pth"
-
-print("Pretraining is starting...") 
-for epoch in tqdm(range(CFG.PRETRAIN_EPOCHS)):
-    loss_sum = 0.0
-    for i, (x_categorical, x_continuous) in enumerate(train_loader):
-        x_categorical, x_continuous = x_categorical.to(CFG.DEVICE), x_continuous.to(CFG.DEVICE)
-        loss = model(x_categorical, x_continuous)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        loss_sum += loss.item()
-
-    epoch_loss = loss_sum/i
-    if epoch_loss < min(losses):
-        best_epoch = epoch
-        torch.save(model.state_dict(), checkpoint_path)
-    losses.append(epoch_loss)
-
-    print(f"Epoch {epoch+1}/{CFG.PRETRAIN_EPOCHS}: loss {epoch_loss: .4f}")
-
-model.load_state_dict(torch.load(checkpoint_path))
-print(f"Pretraining has finished.\nBest Epoch is {best_epoch} with loss {min(losses)} !")
-# -
-
-4096 / (2**8)
-
-epoch_loss
 
 # ## Deep Learning
 
@@ -1807,39 +1574,57 @@ if CFG.SUBMISSION_MODE:
 else:
     thresholds = {}
     for level_group in lq_dict.keys():
+        if level_group=="13-22": continue
         print(f"\nlevel_group {level_group} model...")
         
-        # create data loader
-        train_loader, val_loader = create_loader_train(
-                            train[level_group][0],
-                            train[level_group][1],
-                            train_labels,
-                            level_group,
-                            predict_all=CFG.PREDICT_ALL
-                        )
+        # create pretrain loader
+        x_train_loader, x_train_sessions, y_train, x_val_loader, x_val_sessions, y_val = \
+            create_loader_pretrain(
+                x_categorical=datas[level_group]["train"][0],
+                x_continuous=datas[level_group]["train"][1],
+                y=train_labels,
+                session_index=datas[level_group]["train"][2],
+                level_group=level_group,
+            )
+        
         # pretraining
-        pretrained_model = pretraining(
-            train_loader,
-            level_group,
+        pretrain_model, x_dict_train, x_dict_val = pretraining(
+            pretrain_loader=x_train_loader,
+            dp=datas[level_group]["dp"],
+            level_group=level_group,
             epochs=CFG.PRETRAIN_EPOCHS,
-            omit=CFG.PRETRAINING_OMIT
+            pretrain_loader_val=x_val_loader,
+            pretrain_sessions=x_train_sessions,
+            pretrain_sessions_val=x_val_sessions,
+            omit=CFG.PRETRAIN_OMIT,
+            omit_data_dict=CFG.PRETRAIN_OMIT,
+            agg_func=torch.mean
         )
-            
+        
+        del x_train_loader, x_val_loader
+        gc.collect()
+        
+        # create train loader
+        train_loader, val_loader = create_loader_train(
+            x_dict_train, y_train, x_dict_val, y_val
+        )
+                    
         # training
         model, best_threshold = training(
             train_loader,
             val_loader,
-            MultiOutputsModel,
-            pretrained_model,
-            omit=True#CFG.TRAINING_OMIT
+            model_class=MultiOutputsModel,
+            num_inputs=pretrain_model.num_outputs_projection_head,
+            level_group=level_group,
+            omit=CFG.TRAINING_OMIT
         )
         
-        best_threshold = explore_threshold(model, val_loader)
+        #best_threshold = explore_threshold(model, val_loader)
             
         # predicting
-        submission = predict(test[level_group], model, level_group, best_threshold)
-        display(submission)
-        submission.to_csv("submission.csv", index=False)
+        #submission = predict(test[level_group], model, level_group, best_threshold)
+        #display(submission)
+        #submission.to_csv("submission.csv", index=False)
         
         thresholds[level_group] = best_threshold
         
